@@ -8,26 +8,36 @@ from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_openai import ChatOpenAI
 
 # Load env
-load_dotenv()
+load_dotenv(override=True)
 API_KEY = os.getenv("OPENROUTER_API_KEY")
 
+if not API_KEY:
+    raise ValueError("OPENROUTER_API_KEY manquante.")
+
 PDF_FILE = "./pdfs/reglements.pdf"
-PERSIST_DIR = "./db_test"
+PERSIST_DIR = "./db_vector"
 COLLECTION_NAME = "reglements_v1"
 
-# LLM
+# --- LLM principal ---
 llm = ChatOpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=API_KEY,
     model="openai/gpt-oss-20b:free"
 )
 
-# Embeddings
+# --- LLM judge ---
+groundness_checker = ChatOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=API_KEY,
+    model="nvidia/nemotron-3-ultra-550b-a55b:free"
+)
+
+# --- Embeddings ---
 embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
-# Charger ou créer la base UNE SEULE FOIS
+# --- Charger ou créer la base ---
 if os.path.exists(PERSIST_DIR) and os.listdir(PERSIST_DIR):
     vectorstore = Chroma(
         collection_name=COLLECTION_NAME,
@@ -52,18 +62,20 @@ else:
         persist_directory=PERSIST_DIR
     )
 
+
 # Retriever
 retriever = vectorstore.as_retriever(
     search_type='similarity',
     search_kwargs={'k': 5}
 )
 
-# Prompt
-PROMPT_TEMPLATE = """
-Tu es un assistant.
 
-Réponds uniquement avec le contexte fourni.
-Si tu ne sais pas, dis "I DO NOT KNOW".
+
+# --- Prompt ---
+prompt_template = """
+Tu es un assistant chargé de répondre aux questions en te basant UNIQUEMENT sur le contexte fourni.
+
+Si la réponse n’est pas clairement présente, réponds EXACTEMENT : JE NE SAIS PAS
 
 <context>
 {context}
@@ -72,17 +84,40 @@ Si tu ne sais pas, dis "I DO NOT KNOW".
 <question>
 {question}
 </question>
+
+Réponse :
 """
 
-def run_rag(query: str):
-    docs = retriever.invoke(query)
+def run_rag(question: str):
+    docs = retriever.invoke(question)
     context = ". ".join([d.page_content for d in docs])
 
-    prompt = PROMPT_TEMPLATE.format(
+    prompt = prompt_template.format(
         context=context,
-        question=query
+        question=question
     )
 
     response = llm.invoke(prompt)
+    return response.content, context
+
+# --- Evaluation ---
+def evaluate(question: str, context: str, answer: str):
+
+    system_message = """Évalue si la réponse est fondée sur le contexte. Score de 1 à 5 + explication."""
+
+    prompt = f"""
+        {system_message}
+
+        Question:
+        {question}
+
+        Context:
+        {context}
+
+        Answer:
+        {answer}
+    """
+
+    response = groundness_checker.invoke(prompt)
     return response.content
 
