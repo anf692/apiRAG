@@ -2,7 +2,7 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 
-from .services.rag_pipeline import run_rag
+from .services.rag_pipeline import run_rag, evaluate
 
 class RAGAPIView(APIView):
 
@@ -16,11 +16,13 @@ class RAGAPIView(APIView):
             )
 
         try:
-            answer = run_rag(question)
+            answer, context = run_rag(question)
+            evaluation = evaluate(question, context, answer)
 
             return Response({
                 "question": question,
-                "answer": answer
+                "answer": answer,
+                "evaluation": evaluation
             })
 
         except Exception as e:
@@ -29,4 +31,3 @@ class RAGAPIView(APIView):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
-    
