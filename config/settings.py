@@ -40,7 +40,20 @@ INSTALLED_APPS = [
 
     'rag',
     'rest_framework',
+    'drf_spectacular',
 ]
+
+
+REST_FRAMEWORK = {
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
+}
+
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'RAG API',
+    'DESCRIPTION': 'API en utilisant un systeme RAG pour gerer la reglement du P9 DWWM + IA',
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False,
+}
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
