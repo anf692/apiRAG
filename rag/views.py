@@ -1,33 +1,29 @@
-from rest_framework.views import APIView
+from drf_spectacular.utils import extend_schema
+from rest_framework.generics import GenericAPIView
 from rest_framework.response import Response
-from rest_framework import status
 
+from .serializers import RAGRequestSerializer
 from .services.rag_pipeline import run_rag, evaluate
 
-class RAGAPIView(APIView):
 
+class RAGAPIView(GenericAPIView):
+    serializer_class = RAGRequestSerializer
+
+    @extend_schema(request=RAGRequestSerializer)
     def post(self, request):
-        question = request.data.get("question")
+        serializer = self.get_serializer(data=request.data)
 
-        if not question:
-            return Response(
-                {"error": "Question manquante"},
-                status=status.HTTP_400_BAD_REQUEST
-            )
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=400)
 
-        try:
-            answer, context = run_rag(question)
-            evaluation = evaluate(question, context, answer)
+        question = serializer.validated_data["question"]
 
-            return Response({
-                "question": question,
-                "answer": answer,
-                "evaluation": evaluation
-            })
+        answer, context = run_rag(question)
+        evaluation = evaluate(question, context, answer)
 
-        except Exception as e:
-            return Response(
-                {"error": str(e)},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+        return Response({
+            "question": question,
+            "answer": answer,
+            "evaluation": evaluation
+        })
 
