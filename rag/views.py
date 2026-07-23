@@ -3,7 +3,7 @@ from rest_framework.generics import GenericAPIView
 from rest_framework.response import Response
 
 from .serializers import RAGRequestSerializer
-from .services.rag_pipeline import run_rag, evaluate
+from .services.rag_pipeline import run_rag, evaluate, multilingual_rag
 
 
 class RAGAPIView(GenericAPIView):
@@ -18,12 +18,21 @@ class RAGAPIView(GenericAPIView):
 
         question = serializer.validated_data["question"]
 
-        answer, context = run_rag(question)
-        evaluation = evaluate(question, context, answer)
+        result = multilingual_rag(question)
+
+        evaluation = evaluate(
+            result["question_fr"],
+            result["context"],
+            result["reponse_fr"]
+        )
 
         return Response({
-            "question": question,
-            "answer": answer,
+            "question": result["question_originale"],
+            "question_fr": result["question_fr"],
+            "answer_fr": result["reponse_fr"],
+            "answer_wolof": result["reponse_wolof"],
             "evaluation": evaluation
         })
 
+    
+    
