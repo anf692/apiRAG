@@ -1,88 +1,104 @@
-import os
-from dotenv import load_dotenv
-
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import Chroma
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_openai import ChatOpenAI
+from dotenv import load_dotenv
+import os
 
-# Load env
-load_dotenv(override=True)
+
+# --- Configuration---
+
+# charge le .env et si la variable existe deja dans le systeme ecrasse-la  avec celle du .env
+load_dotenv(override=True) 
+ 
 API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 if not API_KEY:
-    raise ValueError("OPENROUTER_API_KEY manquante.")
+    raise ValueError("OPENROUTER_API_KEY manquante. Vérifie ton fichier .env")
+
+
 
 PDF_FILE = "./pdfs/reglements.pdf"
 PERSIST_DIR = "./db_vector"
 COLLECTION_NAME = "reglements_v1"
+ 
 
-# --- LLM principal ---
+# --- LLM principal (répond aux questions) ---
 llm = ChatOpenAI(
     base_url="https://openrouter.ai/api/v1",
     api_key=API_KEY,
     model="openai/gpt-oss-20b:free"
 )
 
-# --- LLM judge ---
-groundness_checker = ChatOpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=API_KEY,
-    model="nvidia/nemotron-3-ultra-550b-a55b:free"
+
+# --- 1. Chargement et découpage du PDF ---
+loader = PyPDFLoader(PDF_FILE) #charge le pdf
+
+#
+text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+    encoding_name="o200k_base",
+    chunk_size=300,
+    chunk_overlap=50  # évite de couper une idée en plein milieu entre deux chunks
 )
 
-#LLM Traducteur
-traducteur = ChatOpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=API_KEY,
-    model="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
-)
+ 
+chunks = loader.load_and_split(text_splitter)
+print(f"Nombre de chunks générés : {len(chunks)}")
 
-# --- Embeddings ---
+
+# --- 2. Embeddings + base vectorielle ---
 embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
-# --- Charger ou créer la base ---
+ 
+# On évite de reconstruire la base si elle existe déjà (sinon doublons à chaque run)
 if os.path.exists(PERSIST_DIR) and os.listdir(PERSIST_DIR):
     vectorstore = Chroma(
         collection_name=COLLECTION_NAME,
         embedding_function=embedding_model,
         persist_directory=PERSIST_DIR
     )
+    print("Base vectorielle existante chargée.")
 else:
-    loader = PyPDFLoader(PDF_FILE)
-
-    text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
-        encoding_name="o200k_base",
-        chunk_size=300,
-        chunk_overlap=50
-    )
-
-    chunks = loader.load_and_split(text_splitter)
-
     vectorstore = Chroma.from_documents(
         chunks,
         embedding_model,
         collection_name=COLLECTION_NAME,
         persist_directory=PERSIST_DIR
     )
-
-
-# Retriever
+    print("Nouvelle base vectorielle créée.")
+ 
 retriever = vectorstore.as_retriever(
     search_type='similarity',
     search_kwargs={'k': 5}
 )
 
 
-
-# --- Prompt ---
+# --- 3. Prompt template ---
 prompt_template = """
 Tu es un assistant chargé de répondre aux questions en te basant UNIQUEMENT sur le contexte fourni.
 
-Si la réponse n’est pas clairement présente, réponds EXACTEMENT : JE NE SAIS PAS
+Le contexte est un document de règlement intérieur.
+
+RÈGLES STRICTES :
+
+* Utilise UNIQUEMENT les informations présentes dans le contexte.
+* N’utilise AUCUNE connaissance externe.
+* Si la réponse n’est pas clairement présente dans le contexte, réponds EXACTEMENT : JE NE SAIS PAS
+* Sois précis, clair et concis.
+* Si possible, cite la règle correspondante (Article, Chapitre, etc.)
+
+COMPRÉHENSION :
+
+* Fais preuve de tolérance face aux variations de langage (ex : “le” vs “la”, singulier/pluriel, petites fautes).
+* Si la question est légèrement différente mais que le sens global correspond au contexte, considère-la comme valide.
+* Base-toi sur le sens global de la phrase et non uniquement sur une correspondance exacte mot à mot.
+
+LANGUE :
+
+* Réponds uniquement en français.
 
 <context>
 {context}
@@ -93,123 +109,96 @@ Si la réponse n’est pas clairement présente, réponds EXACTEMENT : JE NE SAI
 </question>
 
 Réponse :
+
 """
-
-def run_rag(question: str):
-    docs = retriever.invoke(question)
-    context = ". ".join([d.page_content for d in docs])
-
-    prompt = prompt_template.format(
-        context=context,
-        question=question
-    )
-
-    response = llm.invoke(prompt)
-    return response.content, context
+ 
+ 
+def RAG(query, llm=llm, prompt_template=prompt_template):
+    """Récupère le contexte pertinent puis génère une réponse fondée dessus."""
+    context_docs = retriever.invoke(query)
+    context_list = [d.page_content for d in context_docs]
+    context_for_query = ". ".join(context_list)
+    prompt = prompt_template.format(context=context_for_query, question=query)
+    resp = llm.invoke(prompt)
+    return resp.content
 
 
-def traducteur_francais(text):
+# --- 4. Évaluation (LLM-as-a-judge) ---
+groundedness_rater_system_message = """
+Vous êtes un évaluateur expert chargé d'analyser la qualité des réponses générées par une IA.
+ 
+On vous fournira une entrée structurée contenant :
+- ###Question : la question posée par l'utilisateur
+- ###Context : le contexte utilisé pour générer la réponse
+- ###Answer : la réponse générée par l'IA
+ 
+OBJECTIF :
+Évaluer si la réponse est STRICTEMENT fondée sur le contexte fourni.
+ 
+CRITÈRE (Groundedness) :
+La réponse doit être entièrement dérivée du contexte.
+Aucune information ne doit être inventée ou ajoutée.
+ 
+ÉCHELLE DE NOTATION :
+1 → Pas du tout fondée sur le contexte (hallucinations majeures)
+2 → Faiblement fondée (beaucoup d'ajouts ou erreurs)
+3 → Moyennement fondée (quelques erreurs ou ajouts)
+4 → Majoritairement fondée (légères imprécisions)
+5 → Totalement fondée (aucune hallucination)
+ 
+INSTRUCTIONS :
+1. Analysez la réponse phrase par phrase
+2. Comparez chaque information avec le contexte
+3. Identifiez :
+   - informations correctes
+   - informations absentes du contexte
+   - éventuelles hallucinations
+4. Expliquez clairement votre raisonnement
+ 
+FORMAT DE SORTIE (OBLIGATOIRE) :
+ 
+Analyse:
+- ...
+ 
+Points corrects:
+- ...
+ 
+Erreurs / hallucinations:
+- ...
+ 
+Score: X/5
+"""
+ 
+user_message_template = """
+###Question
+{question}
+###Context
+{context}
+###Answer
+{answer}
+"""
+ 
+groundness_checker = ChatOpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=API_KEY,
+    model="nvidia/nemotron-3-ultra-550b-a55b:free"
+)
+ 
+ 
+def evaluate(question, context, answer, model=groundness_checker):
+    """Évalue si la réponse est bien fondée sur le contexte."""
     prompt = f"""
-        Tu es un traducteur expert bilingue (wolof ↔ français), spécialisé dans les textes officiels et réglementaires.
+    {groundedness_rater_system_message}
 
-        MISSION :
-        Traduire le texte wolof fourni en français de manière STRICTE et FIDÈLE.
+    USER :
+    ###Question
+    {question}
 
-        RÈGLES OBLIGATOIRES :
+    ###Context
+    {context}
 
-        1. Ne modifie PAS le sens du texte
-        2. Ne simplifie PAS le contenu
-        3. Ne résume PAS
-        4. Ne rajoute AUCUNE information
-        5. Respecte le ton formel du texte
-        6. Traduis chaque phrase avec précision
-        7. Si un terme n’a pas d’équivalent exact en français, garde-le en wolof
-
-        FORMAT DE SORTIE :
-
-        - Donne UNIQUEMENT la traduction finale
-        - AUCUNE explication
-        - AUCUN commentaire
-        - AUCUN texte supplémentaire
-
-        IMPORTANT :
-        Prends le temps de bien comprendre le texte avant de traduire.
-
-        TEXTE :
-        {text}
+    ###Answer
+    {answer}
     """
-    return traducteur.invoke(prompt).content.strip()
-
-
-def traducteur_wolof(text):
-    prompt = f"""
-        Tu es un traducteur expert bilingue (français ↔ wolof), spécialisé dans les textes officiels et réglementaires.
-
-        MISSION :
-        Traduire le texte français fourni en wolof de manière STRICTE et FIDÈLE.
-
-        RÈGLES OBLIGATOIRES :
-
-        1. Ne modifie PAS le sens du texte
-        2. Ne simplifie PAS le contenu
-        3. Ne résume PAS
-        4. Ne rajoute AUCUNE information
-        5. Respecte le ton formel du texte
-        6. Traduis chaque phrase avec précision
-        7. Si un terme n’a pas d’équivalent exact en wolof, garde-le en français
-
-        FORMAT DE SORTIE :
-
-        - Donne UNIQUEMENT la traduction finale
-        - AUCUNE explication
-        - AUCUN commentaire
-        - AUCUN texte supplémentaire
-
-        IMPORTANT :
-        Prends le temps de bien comprendre le texte avant de traduire.
-
-        TEXTE :
-        {text}
-    """
-    return traducteur.invoke(prompt).content.strip()
-
-
-def multilingual_rag(user_question):
-    # 1. Traduction vers français
-    question_fr = traducteur_francais(user_question)
-
-    # 2. RAG
-    answer_fr, context = run_rag(question_fr)
-
-    # 3. Traduction vers wolof
-    answer_wolof = traducteur_wolof(answer_fr)
-
-    return {
-        "question_originale": user_question,
-        "question_fr": question_fr,
-        "reponse_fr": answer_fr,
-        "reponse_wolof": answer_wolof,
-        "context": context
-    }
-
-# --- Evaluation ---
-def evaluate(question: str, context: str, answer: str):
-
-    system_message = """Évalue si la réponse est fondée sur le contexte. Score de 1 à 5 + explication."""
-
-    prompt = f"""
-        {system_message}
-
-        Question:
-        {question}
-
-        Context:
-        {context}
-
-        Answer:
-        {answer}
-    """
-
-    response = groundness_checker.invoke(prompt)
-    return response.content
-
+    juge_response = model.invoke(prompt)
+    return juge_response.content
